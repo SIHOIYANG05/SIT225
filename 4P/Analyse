@@ -1,0 +1,208 @@
+from pathlib import Path
+import hashlib
+import json
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+PROJECT_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = PROJECT_DIR / "analysis_30min"
+SESSIONS = {
+    "S01": ("idle", "closed"),
+    "S02R2": ("idle", "open"),
+    "S04": ("high", "closed"),
+    "S032": ("high", "open"),
+}
+SENSORS = ["indoor_temp_c", "indoor_rh", "outdoor_temp_c",
+           "outdoor_rh", "pc_exhaust_temp_c", "co2_ppm"]
+# Existing protocol screening ranges. A flag is not a diagnosis of sensor failure.
+RANGES = {
+    "indoor_temp_c": (5, 40), "outdoor_temp_c": (5, 40),
+    "indoor_rh": (10, 90), "outdoor_rh": (10, 90),
+    "pc_exhaust_temp_c": (5, 80), "co2_ppm": (350, 5000),
+}
+COLORS = ["#0072B2", "#E69F00", "#009E73", "#CC79A7"]
+LABELS = {sid: f"{work.title()} / {window} ({sid})"
+          for sid, (work, window) in SESSIONS.items()}
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def prepare_data(project_dir=PROJECT_DIR):
+    raw_parts, processed_parts, qa_rows = [], [], []
+    source_hashes = {}
+    for sid, (workload, window) in SESSIONS.items():
+        csv_path = project_dir / "data" / "session_backups" / f"{sid}_raw.csv"
+        meta_path = project_dir / "data" / "session_metadata_private" / f"{sid}.json"
+        for path in (csv_path, meta_path):
+            source_hashes[str(path.relative_to(project_dir))] = digest(path)
+        source = pd.read_csv(csv_path, dtype={"session_id": str})
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        required = {"session_id", "workload", "window_state", "elapsed_seconds", *SENSORS}
+        if not required.issubset(source.columns):
+            raise ValueError(f"{sid}: missing required columns: {required - set(source.columns)}")
+        for column, expected in [("session_id", sid), ("workload", workload),
+                                 ("window_state", window)]:
+            if not source[column].eq(expected).all() or meta.get(column) != expected:
+                raise ValueError(f"{sid}: unexpected {column}; inspect source labels.")
+        if meta.get("status") not in {"completed", "incomplete"}:
+            raise ValueError(f"{sid}: recording may still be running. Finish it first.")
+        times = pd.to_numeric(source["elapsed_seconds"], errors="coerce")
+        if times.isna().any() or not np.isfinite(times).all() or (times < 0).any():
+            raise ValueError(f"{sid}: invalid elapsed time.")
+        if times.duplicated().any() or not times.is_monotonic_increasing:
+            raise ValueError(f"{sid}: duplicate/out-of-order timestamps need review.")
+        if len(source) != meta.get("rows"):
+            raise ValueError(f"{sid}: row count differs from saved metadata.")
+        source["source_file"] = str(csv_path.relative_to(project_dir)).replace("\\", "/")
+        source["original_status"] = meta["status"]
+        source["original_duration_minutes"] = float(times.max()) / 60
+        raw_parts.append(source)
+
+        # Ratings at the original end (usually 45 minutes) are not 30-minute ratings.
+        selected_columns = ["session_id", "workload", "window_state", "elapsed_seconds",
+                            *SENSORS, "source_file", "original_status", "original_duration_minutes"]
+        selected = source.loc[times.between(0, 1800), selected_columns].copy()
+        selected["elapsed_seconds"] = times.loc[selected.index].astype(int)
+        if not np.array_equal(times.loc[selected.index].to_numpy(), np.arange(0, 1801, 10)):
+            raise ValueError(f"{sid}: the 0-30 minute window has missing/off-grid times; review before plotting.")
+        selected["elapsed_minutes"] = selected["elapsed_seconds"] / 60
+        selected["condition"] = LABELS[sid]
+        selected["data_origin"] = "measured"
+        selected["analysis_window_seconds"] = 1800
+        selected["quality_flags"] = ""
+        for column in SENSORS:
+            numeric = pd.to_numeric(selected[column], errors="coerce")
+            missing = numeric.isna() | ~np.isfinite(numeric)
+            low, high = RANGES[column]
+            out_of_range = ~missing & ~numeric.between(low, high)
+            selected.loc[missing, "quality_flags"] += f"{column}:missing;"
+            selected.loc[out_of_range, "quality_flags"] += f"{column}:range_flag;"
+            selected[column] = numeric.mask(missing | out_of_range)
+            qa_rows.append({
+                "session_id": sid, "condition": LABELS[sid], "variable": column,
+                "original_status": meta["status"], "source_rows": len(source),
+                "original_duration_minutes": float(times.max()) / 60,
+                "source_max_gap_seconds": float(times.diff().max()),
+                "selected_rows": len(selected), "selected_max_gap_seconds": 10,
+                "missing_or_non_numeric": int(missing.sum()),
+                "range_flag_count": int(out_of_range.sum()),
+                "valid_values": int(selected[column].notna().sum()),
+                "unavailable_percent": 100 * float(selected[column].isna().mean()),
+            })
+        processed_parts.append(selected)
+
+    raw = pd.concat(raw_parts, ignore_index=True)
+    processed = pd.concat(processed_parts, ignore_index=True)
+    qa = pd.DataFrame(qa_rows)
+    if not processed[["indoor_temp_c", "indoor_rh", "co2_ppm"]].notna().all().all():
+        raise ValueError("A graph variable contains missing/flagged values. Review quality before plotting.")
+    return raw, processed, qa, source_hashes
+
+
+def descriptive_statistics(processed):
+    rows = []
+    for sid in SESSIONS:
+        group = processed.loc[processed.session_id.eq(sid)]
+        for column in SENSORS:
+            values = group[column].dropna()
+            rows.append({"session_id": sid, "condition": LABELS[sid], "variable": column,
+                         "valid_readings": len(values), "mean": values.mean(),
+                         "median": values.median(), "std_dev": values.std(ddof=1),
+                         "minimum": values.min(), "maximum": values.max(),
+                         "range": values.max() - values.min(),
+                         "percentile_25": values.quantile(.25),
+                         "percentile_75": values.quantile(.75),
+                         "percentile_95": values.quantile(.95)})
+    return pd.DataFrame(rows)
+
+
+def new_figure(title):
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11,
+                         "axes.spines.top": False, "axes.spines.right": False})
+    fig, ax = plt.subplots(figsize=(10.5, 6.4))
+    fig.subplots_adjust(left=.11, right=.97, bottom=.21, top=.77)
+    fig.suptitle(title, x=.11, y=.965, ha="left", fontsize=17, fontweight="bold")
+    fig.text(.11, .905, "Measured data | first 30 minutes | one session per condition", fontsize=10)
+    ax.grid(axis="y", color="#E2E5EA", linewidth=.7)
+    ax.set_axisbelow(True)
+    return fig, ax
+
+
+def finish_figure(fig, ax, filename, caption, output_dir):
+    ax.legend(loc="lower left", bbox_to_anchor=(-.01, 1.01), ncol=2,
+              frameon=False, fontsize=9)
+    fig.text(.11, .105, caption, fontsize=9)
+    fig.text(.11, .055, "S032 stopped at 33.5 min; only its first 30 min are used. No simulated values.",
+             fontsize=9, color="#4D5664")
+    fig.savefig(output_dir / filename, dpi=200, facecolor="white")
+    plt.close(fig)
+
+
+def create_graphs(processed, output_dir=OUTPUT_DIR):
+    fig, ax = new_figure("Indoor temperature over time")
+    for (sid, (_, window)), color in zip(SESSIONS.items(), COLORS):
+        group = processed.loc[processed.session_id.eq(sid)]
+        ax.plot(group.elapsed_minutes, group.indoor_temp_c, label=LABELS[sid],
+                color=color, linewidth=1.8, linestyle="--" if window == "open" else "-")
+    ax.set(xlabel="Elapsed time (minutes)", ylabel="Indoor temperature (°C)",
+           xlim=(0, 30), xticks=np.arange(0, 31, 5))
+    finish_figure(fig, ax, "01_temperature_time_series.png",
+                  "Each line contains 181 readings. Different starting temperatures limit direct condition comparisons.", output_dir)
+
+    fig, ax = new_figure("Distribution of indoor humidity")
+    values = processed.indoor_rh.dropna()
+    bins = np.arange(np.floor(values.min()), np.ceil(values.max()) + 1, 1)
+    for sid, color in zip(SESSIONS, COLORS):
+        group = processed.loc[processed.session_id.eq(sid)]
+        ax.hist(group.indoor_rh.dropna(), bins=bins, histtype="step", linewidth=2,
+                label=LABELS[sid], color=color)
+    ax.set(xlabel="Indoor relative humidity (%)", ylabel="Number of readings")
+    ax.set_ylim(bottom=0)
+    finish_figure(fig, ax, "02_humidity_distribution.png",
+                  "Identical 1-percentage-point bins for every condition. Counts are readings, not independent trials.", output_dir)
+
+    fig, ax = new_figure("Indoor temperature and CO₂")
+    for sid, color, marker in zip(SESSIONS, COLORS, ["o", "s", "^", "D"]):
+        group = processed.loc[processed.session_id.eq(sid)]
+        ax.scatter(group.indoor_temp_c, group.co2_ppm, label=LABELS[sid], color=color,
+                   marker=marker, s=20, alpha=.65, edgecolors="none")
+    ax.set(xlabel="Indoor temperature (°C)", ylabel="CO₂ concentration (ppm)")
+    finish_figure(fig, ax, "03_temperature_vs_co2.png",
+                  "Each point is one 10-second reading. Descriptive association only; no causal or significance claim.", output_dir)
+
+
+def main():
+    raw, processed, qa, hashes = prepare_data()
+    statistics = descriptive_statistics(processed)
+    # Originals live under data/. All newly derived files go to a separate folder.
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    raw.to_csv(OUTPUT_DIR / "raw_selected_sessions.csv", index=False)
+    processed.to_csv(OUTPUT_DIR / "processed_30min.csv", index=False)
+    qa.to_csv(OUTPUT_DIR / "data_quality_30min.csv", index=False)
+    statistics.to_csv(OUTPUT_DIR / "descriptive_statistics_30min.csv", index=False)
+    create_graphs(processed)
+
+    # Recheck that analysis left all selected original files byte-for-byte intact
+    if any(digest(PROJECT_DIR / relative) != expected for relative, expected in hashes.items()):
+        raise RuntimeError("A source changed during analysis. Do not use these outputs until reviewed.")
+    manifest = {"analysis_window_seconds": [0, 1800], "data_origin": "measured",
+                "source_sha256": hashes, "original_files_unchanged": True,
+                "session_count": 4, "processed_rows": len(processed),
+                "s032_original_status": "incomplete", "interpolation": "none"}
+    (OUTPUT_DIR / "provenance.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print("Created three graphs from 724 real readings (181 per condition).")
+    print("Original recordings and statuses unchanged. No serial port was opened.")
+    print("Missing/range-flagged sensor values:")
+    print(qa.loc[(qa.missing_or_non_numeric > 0) | (qa.range_flag_count > 0),
+                 ["session_id", "variable", "missing_or_non_numeric", "range_flag_count"]].to_string(index=False))
+    print(f"Saved graphs and analysis files: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
